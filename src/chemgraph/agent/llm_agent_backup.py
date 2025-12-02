@@ -26,17 +26,11 @@ from chemgraph.prompt.multi_agent_prompt import (
     aggregator_prompt,
     planner_prompt,
 )
-from chemgraph.prompt.active_space_prompts import (
-    active_space_reasoner_prompt,
-    active_space_executor_prompt,
-    active_space_critic_prompt,
-)
 from chemgraph.graphs.single_agent import construct_single_agent_graph
 from chemgraph.graphs.python_relp_agent import construct_relp_graph
 from chemgraph.graphs.multi_agent import contruct_multi_agent_graph
 from chemgraph.graphs.graspa_agent import construct_graspa_graph
 from chemgraph.graphs.mock_agent import construct_mock_agent_graph
-from chemgraph.graphs.active_space import construct_active_space_graph
 
 import logging
 
@@ -84,7 +78,6 @@ class ChemGraph:
         - "multi_agent"
         - "python_relp"
         - "graspa_agent"
-        - "active_space"
         by default "single_agent"
     base_url : str, optional
         Base URL for API calls, by default None
@@ -123,16 +116,12 @@ class ChemGraph:
         structured_output: bool = False,
         return_option: str = "last_message",
         recursion_limit: int = 50,
-        tools: list = None,
         planner_prompt: str = planner_prompt,
         executor_prompt: str = executor_prompt,
         aggregator_prompt: str = aggregator_prompt,
         formatter_multi_prompt: str = formatter_multi_prompt,
         generate_report: bool = False,
         report_prompt: str = report_prompt,
-        active_space_reasoner_prompt: str = active_space_reasoner_prompt,
-        active_space_executor_prompt: str = active_space_executor_prompt,
-        active_space_critic_prompt: str = active_space_critic_prompt,
     ):
         try:
             # Use hardcoded optimal values for tool calling
@@ -219,21 +208,16 @@ class ChemGraph:
         self.report_prompt = report_prompt
         self.return_option = return_option
         self.recursion_limit = recursion_limit
-        self.tools = tools
         self.planner_prompt = planner_prompt
         self.executor_prompt = executor_prompt
         self.aggregator_prompt = aggregator_prompt
         self.formatter_multi_prompt = formatter_multi_prompt
-        self.active_space_reasoner_prompt = active_space_reasoner_prompt
-        self.active_space_executor_prompt = active_space_executor_prompt
-        self.active_space_critic_prompt = active_space_critic_prompt
         self.workflow_map = {
             "single_agent": {"constructor": construct_single_agent_graph},
             "multi_agent": {"constructor": contruct_multi_agent_graph},
             "python_relp": {"constructor": construct_relp_graph},
             "graspa": {"constructor": construct_graspa_graph},
             "mock_agent": {"constructor": construct_mock_agent_graph},
-            "active_space": {"constructor": construct_active_space_graph},
         }
 
         if workflow_type not in self.workflow_map:
@@ -249,7 +233,6 @@ class ChemGraph:
                 self.formatter_prompt,
                 self.generate_report,
                 self.report_prompt,
-                self.tools,
             )
         elif self.workflow_type == "multi_agent":
             self.workflow = self.workflow_map[workflow_type]["constructor"](
@@ -276,14 +259,6 @@ class ChemGraph:
             self.workflow = self.workflow_map[workflow_type]["constructor"](
                 llm=llm,
                 system_prompt=self.system_prompt,
-            )
-        elif self.workflow_type == "active_space":
-            self.workflow = self.workflow_map[workflow_type]["constructor"](
-                llm,
-                reasoner_prompt=self.active_space_reasoner_prompt,
-                executor_prompt=self.active_space_executor_prompt,
-                critic_prompt=self.active_space_critic_prompt,
-                tools=self.tools,
             )
 
     def visualize(self):
@@ -411,12 +386,6 @@ class ChemGraph:
                     "aggregator_prompt": self.aggregator_prompt,
                     "formatter_prompt": self.formatter_multi_prompt,
                 })
-            elif self.workflow_type == "active_space":
-                output_data.update({
-                    "reasoner_prompt": self.active_space_reasoner_prompt,
-                    "executor_prompt": self.active_space_executor_prompt,
-                    "critic_prompt": self.active_space_critic_prompt,
-                })
             else:
                 output_data.update({
                     "system_prompt": "unknown",
@@ -472,7 +441,7 @@ class ChemGraph:
             # Construct the workflow graph
             workflow = self.workflow
 
-            if self.workflow_type in {"single_agent", "graspa", "python_relp", "mock_agent", "active_space"}:
+            if self.workflow_type in {"single_agent", "graspa", "python_relp", "mock_agent"}:
                 inputs = {"messages": query}
 
                 prev_messages = []
