@@ -12,6 +12,7 @@ from chemgraph.tools.cheminformatics_tools import (
     molecule_name_to_smiles,
     smiles_to_atomsdata,
 )
+from chemgraph.tools.pyscf_tools import run_pyscf_casscf
 from chemgraph.tools.report_tools import generate_html
 from chemgraph.tools.generic_tools import calculator
 from chemgraph.models.agent_response import ResponseFormatter
@@ -140,6 +141,7 @@ def ChemGraphAgent(state: State, llm: ChatOpenAI, system_prompt: str, tools=None
             molecule_name_to_smiles,
             save_atomsdata_to_file,
             calculator,
+            run_pyscf_casscf,
         ]
     messages = [
         {"role": "system", "content": system_prompt},
@@ -236,7 +238,7 @@ def construct_single_agent_graph(
         The list of tools for the main agent, by default None
     Returns
     -------
-    StateGraph
+        StateGraph
         The constructed single agent graph
     """
     try:
@@ -250,6 +252,7 @@ def construct_single_agent_graph(
                 molecule_name_to_smiles,
                 save_atomsdata_to_file,
                 calculator,
+                run_pyscf_casscf,
             ]
         tool_node = BasicToolNode(tools=tools)
         graph_builder = StateGraph(State)
