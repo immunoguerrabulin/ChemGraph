@@ -1,3 +1,5 @@
+import math
+from pathlib import Path
 from typing import Optional, Tuple, Union, List, Sequence
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -66,6 +68,56 @@ def _is_transition_metal(z: int) -> bool:
     return (21 <= z <= 30) or (39 <= z <= 48) or (57 <= z <= 80)
 
 
+def _molecular_weight(numbers: Sequence[int]) -> float:
+    """Rough molecular weight from atomic numbers only."""
+    pt = Chem.GetPeriodicTable()
+    return float(sum(pt.GetAtomicWeight(int(z)) for z in numbers))
+
+
+def _distance(a: Sequence[float], b: Sequence[float]) -> float:
+    return float(sum((float(x) - float(y)) ** 2 for x, y in zip(a, b))) ** 0.5
+
+
+def _guess_aromaticity(numbers: Sequence[int], positions: Sequence[Sequence[float]]) -> Tuple[bool, Optional[str]]:
+    """Crude aromaticity detection by inferring bonds from covalent radii and sanitizing with RDKit."""
+    try:
+        pt = Chem.GetPeriodicTable()
+        mol = Chem.RWMol()
+        for z in numbers:
+            mol.AddAtom(Chem.Atom(int(z)))
+
+        n = len(numbers)
+        bonds_added = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                r1 = pt.GetRcovalent(int(numbers[i])) or 0.7
+                r2 = pt.GetRcovalent(int(numbers[j])) or 0.7
+                cutoff = 1.25 * (r1 + r2)
+                if _distance(positions[i], positions[j]) <= cutoff:
+                    mol.AddBond(i, j, Chem.BondType.SINGLE)
+                    bonds_added += 1
+
+        warning = None
+        sanitized = True
+        try:
+            Chem.SanitizeMol(mol)
+        except Exception:
+            sanitized = False
+            warning = "Sanitization failed; aromaticity guess may be unreliable."
+
+        if bonds_added == 0:
+            return False, "No bonds inferred; aromaticity unknown."
+
+        aromatic = any(atom.GetIsAromatic() for atom in mol.GetAtoms()) or any(
+            bond.GetIsAromatic() for bond in mol.GetBonds()
+        )
+        if not sanitized and not warning:
+            warning = "Sanitization skipped."
+        return aromatic, warning
+    except Exception as exc:
+        return False, f"Aromaticity detection error: {exc}"
+
+
 class PySCFCASSCFInput(BaseModel):
     atomsdata: AtomsData = Field(description="Molecular geometry to run PySCF on.")
     basis: str = Field(default="sto-3g", description="Basis set name (e.g., sto-3g, def2-svp).")
@@ -92,6 +144,152 @@ class PySCFCASSCFOutput(BaseModel):
     s2: Optional[float] = None
     multiplicity: Optional[float] = None
     message: str = ""
+
+
+class XYZFileInput(BaseModel):
+    path: str = Field(description="Filesystem path to the XYZ geometry file.")
+
+
+class XYZFileOutput(BaseModel):
+    atomsdata: AtomsData
+    n_atoms: int
+    comment: Optional[str] = None
+    path: str = Field(description="Resolved path to the XYZ file.")
+
+
+@tool
+def load_xyz_geometry(params: XYZFileInput) -> XYZFileOutput:
+    """Read a standard XYZ file and return an AtomsData geometry."""
+
+    xyz_path = Path(params.path).expanduser().resolve()
+    if not xyz_path.exists():
+        raise FileNotFoundError(f"XYZ file not found: {xyz_path}")
+
+    with xyz_path.open("r", encoding="utf-8") as handle:
+        raw_lines = handle.readlines()
+
+    if len(raw_lines) < 2:
+        raise ValueError("XYZ file must include atom count and comment lines.")
+
+    try:
+        n_atoms = int(raw_lines[0].strip().split()[0])
+    except Exception as exc:
+        raise ValueError("First line of XYZ must be the atom count.") from exc
+
+    comment_line = raw_lines[1].rstrip("\n") if len(raw_lines) >= 2 else ""
+    coord_lines = [line.strip() for line in raw_lines[2:] if line.strip()]
+
+    if len(coord_lines) < n_atoms:
+        raise ValueError(
+            f"XYZ file lists {n_atoms} atoms but only {len(coord_lines)} coordinate lines were found."
+        )
+
+    pt = Chem.GetPeriodicTable()
+    numbers: List[int] = []
+    positions: List[List[float]] = []
+
+    for idx in range(n_atoms):
+        fields = coord_lines[idx].split()
+        if len(fields) < 4:
+            raise ValueError(f"XYZ line {idx + 3} must contain symbol and three coordinates.")
+        symbol = fields[0]
+        try:
+            atomic_number = pt.GetAtomicNumber(symbol)
+        except Exception as exc:
+            raise ValueError(f"Unknown chemical symbol '{symbol}' in XYZ file.") from exc
+        try:
+            x, y, z = map(float, fields[1:4])
+        except Exception as exc:
+            raise ValueError(f"Invalid coordinates on line {idx + 3} in XYZ file.") from exc
+
+        numbers.append(int(atomic_number))
+        positions.append([x, y, z])
+
+    atomsdata = AtomsData(numbers=numbers, positions=positions)
+
+    return XYZFileOutput(
+        atomsdata=atomsdata,
+        n_atoms=n_atoms,
+        comment=comment_line or None,
+        path=str(xyz_path),
+    )
+
+
+class StretchBondInput(BaseModel):
+    atomsdata: AtomsData = Field(description="Base geometry to be modified.")
+    atom_a: int = Field(description="Zero-based index of the first atom defining the bond.")
+    atom_b: int = Field(description="Zero-based index of the second atom defining the bond.")
+    delta: float = Field(description="Change in Å to apply to the current bond length (positive stretches).")
+    mode: str = Field(
+        default="move_b",
+        description="How to displace atoms: 'move_b' (default), 'move_a', or 'symmetric'.",
+    )
+
+
+class StretchBondOutput(BaseModel):
+    atomsdata: AtomsData
+    atom_a: int
+    atom_b: int
+    original_distance: float
+    new_distance: float
+    mode: str
+
+
+@tool
+def stretch_bond(params: StretchBondInput) -> StretchBondOutput:
+    """Displace atoms along bond vector to change a bond length by a target increment."""
+
+    numbers = list(params.atomsdata.numbers)
+    positions = [list(map(float, pos)) for pos in params.atomsdata.positions]
+    n_atoms = len(numbers)
+
+    if not (0 <= params.atom_a < n_atoms) or not (0 <= params.atom_b < n_atoms):
+        raise ValueError(f"atom indices must be within [0, {n_atoms - 1}]")
+    if params.atom_a == params.atom_b:
+        raise ValueError("atom_a and atom_b must be different atoms")
+
+    a_pos = positions[params.atom_a]
+    b_pos = positions[params.atom_b]
+    vector = [b - a for a, b in zip(a_pos, b_pos)]
+    distance = math.sqrt(sum(comp * comp for comp in vector))
+    if distance == 0:
+        raise ValueError("Selected atoms occupy the same coordinates; cannot define a bond direction")
+
+    delta = float(params.delta)
+    new_distance = distance + delta
+    if new_distance <= 0:
+        raise ValueError("Resulting bond length must stay positive; reduce |delta|.")
+
+    unit_vec = [comp / distance for comp in vector]
+
+    mode = params.mode.lower().strip()
+    if mode not in {"move_b", "move_a", "symmetric"}:
+        raise ValueError("mode must be 'move_b', 'move_a', or 'symmetric'")
+
+    new_positions = [pos.copy() for pos in positions]
+    if mode == "move_b":
+        shift = [unit * delta for unit in unit_vec]
+        new_positions[params.atom_b] = [b + s for b, s in zip(b_pos, shift)]
+    elif mode == "move_a":
+        shift = [unit * delta for unit in unit_vec]
+        new_positions[params.atom_a] = [a - s for a, s in zip(a_pos, shift)]
+    else:  # symmetric
+        half_shift = [unit * (delta / 2.0) for unit in unit_vec]
+        new_positions[params.atom_b] = [b + s for b, s in zip(b_pos, half_shift)]
+        new_positions[params.atom_a] = [a - s for a, s in zip(a_pos, half_shift)]
+
+    cell = getattr(params.atomsdata, "cell", None)
+    pbc = getattr(params.atomsdata, "pbc", None)
+    stretched = AtomsData(numbers=numbers, positions=new_positions, cell=cell, pbc=pbc)
+
+    return StretchBondOutput(
+        atomsdata=stretched,
+        atom_a=params.atom_a,
+        atom_b=params.atom_b,
+        original_distance=distance,
+        new_distance=new_distance,
+        mode=mode,
+    )
 
 
 @tool
@@ -773,3 +971,82 @@ def prepare_orbitals_and_rank(params: OrbitalPrepInput) -> OrbitalPrepOutput:
             recommended_active_orbitals=[],
             message=str(exc),
         )
+
+
+class ActiveSpacePlanInput(BaseModel):
+    atomsdata: AtomsData = Field(description="Geometry used to build the active space plan.")
+    charge: int = Field(default=0, description="Molecular charge.")
+    spin: int = Field(default=0, description="2S value (0 for closed shell, 1 for doublet, etc.).")
+
+
+class ActiveSpacePlan(BaseModel):
+    n_active_electrons: int
+    n_active_orbitals: int
+    orbital_indices: List[int] = Field(
+        default_factory=list, description="Sorted HF MO indices recommended for the active space."
+    )
+    homo_lumo_gap: Optional[float] = Field(
+        default=None, description="Estimated HOMO-LUMO gap (Hartree) from the ranking SCF."
+    )
+    rationale: str
+    warnings: List[str] = Field(default_factory=list)
+
+
+@tool
+def pick_active_space(params: ActiveSpacePlanInput) -> ActiveSpacePlan:
+    """Let the agent select an active space based on aromaticity, elemental makeup, and molecular weight."""
+
+    numbers = [int(z) for z in params.atomsdata.numbers]
+    positions = params.atomsdata.positions
+    total_electrons = max(sum(numbers) - params.charge, 0)
+    weight = _molecular_weight(numbers)
+    has_tm = any(_is_transition_metal(z) for z in numbers)
+
+    aromatic, aromatic_warning = _guess_aromaticity(numbers, positions)
+    warnings: List[str] = []
+    if aromatic_warning:
+        warnings.append(aromatic_warning)
+
+    scale = "small" if weight < 50 else ("medium" if weight < 150 else "large")
+    n_unpaired = max(params.spin, 0)
+
+    if has_tm:
+        # Favor d-shell coverage; scale with molecular size.
+        n_orb = 8 if scale == "small" else (10 if scale == "medium" else 12)
+        n_elec = n_orb
+    elif aromatic:
+        # Capture pi system; grow mildly with size.
+        n_orb = 6 if scale in ("small", "medium") else 8
+        n_elec = n_orb
+    else:
+        # Non-aromatic main-group: scale gently with molecular weight.
+        if scale == "small":
+            n_orb = 4
+        elif scale == "medium":
+            n_orb = 6
+        else:
+            n_orb = 8
+        n_elec = n_orb
+
+    # Respect spin/unpaired electrons and total electron parity.
+    n_elec = max(n_elec, n_unpaired + (n_unpaired % 2))
+    if n_elec % 2 != total_electrons % 2:
+        n_elec = max(n_elec - 1, n_unpaired)
+    n_elec = min(n_elec, total_electrons)
+
+    rationale_parts = [
+        f"Molecular weight ~ {weight:.1f} amu ({scale})",
+        f"Aromatic: {aromatic}",
+        f"Transition metal present: {has_tm}",
+        f"Spin (2S): {params.spin}",
+    ]
+    rationale = "; ".join(rationale_parts)
+
+    return ActiveSpacePlan(
+        n_active_electrons=int(n_elec),
+        n_active_orbitals=int(n_orb),
+        orbital_indices=[],
+        homo_lumo_gap=None,
+        rationale=f"Frontier-free selection - {rationale}",
+        warnings=warnings,
+    )
